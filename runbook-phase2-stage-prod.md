@@ -60,6 +60,7 @@ aws acm list-certificates --region ap-southeast-2
 ```
 
 > ⚠️ DNS 검증을 위해 Route53에 CNAME 레코드를 추가해야 합니다.
+> 해당리전에 위 명령으로 생성된 ACM 목록 들어가서 Route53에 CNAME 레코드 추가 버튼으로 추가 가능
 
 ---
 
@@ -195,7 +196,110 @@ helm upgrade --install metrics-server metrics-server/metrics-server `
   -n kube-system --set replicas=3
 ```
 
+### 3.4. Helm 설치 주의사항
+
+> ⚠️ **ALB Controller → ExternalDNS 순서 필수**
+
+```powershell
+# 1. ALB Controller 먼저 설치
+helm upgrade --install aws-load-balancer-controller ...
+
+# 2. ALB Controller Ready 확인 (필수!)
+kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
+kubectl -n kube-system get endpoints aws-load-balancer-webhook-service
+
+# 3. Ready 확인 후 ExternalDNS 설치
+helm upgrade --install external-dns ...
+```
+
+> ⚠️ **Webhook 엔드포인트 없음 오류 발생 시**:
+> ALB Controller pods가 아직 Ready 상태가 아님. 잠시 대기 후 재시도.
+
 ---
+
+## 4. PROD 적용 체크리스트
+
+### 4.1. STAGE→PROD 동기화 수정사항
+
+아래 항목들은 STAGE에서 해결된 후 PROD에 동일 적용되었습니다:
+
+| # | 수정 항목 | 파일 | 상태 |
+|:-:|----------|------|:----:|
+| 1 | ECR name_prefix에 environment 포함 | `envs/prod/main.tf` | ✅ |
+| 2 | EKS 모듈 enable_alb_controller_irsa 사용 | `envs/prod/main.tf` | ✅ |
+| 3 | EKS 모듈 external_dns_hosted_zone_id 사용 | `envs/prod/main.tf` | ✅ |
+| 4 | VPC 모듈 eks_cluster_name 사용 | `envs/prod/main.tf` | ✅ |
+| 5 | Valkey Replication Group 기반 | `envs/prod/main.tf` | ✅ |
+| 6 | RDS outputs db_instance_* 사용 | `envs/prod/outputs.tf` | ✅ |
+| 7 | Valkey outputs cache_* 사용 | `envs/prod/outputs.tf` | ✅ |
+
+### 4.2. PROD 전용 설정 확인
+
+| 항목 | 기대값 | 확인 방법 |
+|------|--------|----------|
+| RDS Multi-AZ | `true` | `terraform output rds_multi_az` |
+| RDS 삭제 보호 | `true` | `terraform output rds_deletion_protection` |
+| EKS 노드 수 | 3+ | `kubectl get nodes` |
+| Valkey HA | replicas=1+ | `terraform output valkey_endpoint` |
+| NAT Gateway | AZ별 분리 | AWS 콘솔 |
+
+### 4.3. PROD 배포 전 검증 명령
+
+```powershell
+cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
+
+# 1. 코드 포맷팅
+terraform fmt
+
+# 2. 정적 검증
+terraform validate
+
+# 3. Plan 확인 (리소스 변경 사항 검토)
+terraform plan -out=tfplan
+
+# 4. Plan 내용 검토 후 적용
+terraform apply tfplan
+```
+
+### 4.4. PROD 배포 후 검증
+
+```powershell
+# kubeconfig 설정
+aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-prod-eks --alias prod
+
+# 노드 확인
+kubectl --context prod get nodes
+
+# Addons 확인
+kubectl --context prod -n kube-system get pods | Select-String "aws-load-balancer|external-dns|metrics-server"
+
+# RDS 연결 테스트 (선택)
+terraform output -raw rds_endpoint
+```
+
+### 4.5. PROD 주의사항
+
+> [!CAUTION]
+> **RDS 삭제 보호**: `rds_deletion_protection = true` 설정으로 실수로 삭제 방지
+> 
+> **terraform destroy 전 확인**:
+> ```powershell
+> # RDS 삭제 보호 해제 필요 (의도적 삭제 시)
+> aws rds modify-db-instance --db-instance-identifier <id> --no-deletion-protection
+> ```
+
+> [!WARNING]
+> **비용 주의**: PROD는 Multi-AZ RDS, 다중 NAT Gateway, 더 많은 EKS 노드로 인해 DEV/STAGE보다 비용이 높음
+
+### 4.6. terraform.tfvars 커밋 금지
+
+```powershell
+# 실제 값이 들어간 terraform.tfvars는 절대 커밋하지 않음
+# .gitignore에 추가되어 있는지 확인
+Get-Content .gitignore | Select-String "terraform.tfvars"
+
+# terraform.tfvars.example만 유지
+```
 
 ## 4. Saleor Dashboard ECR 이미지 준비
 
@@ -209,81 +313,88 @@ git clone https://github.com/mandoofu/kyeol-saleor-dashboard.git
 cd kyeol-saleor-dashboard
 ```
 
-### 4.2. Dockerfile 확인/생성
+### 4.2. Saleor Dashboard Image Build & ECR Push (GitHub Actions)
 
-```dockerfile
-# Dockerfile (saleor-dashboard 공식 기반)
-FROM node:18-alpine AS builder
-WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN npm install -g pnpm && pnpm install --frozen-lockfile
-COPY . .
-ARG API_URI
-ENV API_URI=$API_URI
-RUN pnpm build
+#### 디렉토리 구조
 
-FROM nginx:alpine
-COPY --from=builder /app/build /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+```
+kyeol-saleor-dashboard/
+├── .github/
+│   └── workflows/
+│       └── build-push-dashboard-ecr.yml  # ECR 빌드/푸시 워크플로
+├── Dockerfile                             # 멀티스테이지 빌드
+├── nginx/                                 # nginx 설정
+│   └── default.conf
+├── src/                                   # 소스 코드
+├── package.json
+└── pnpm-lock.yaml
 ```
 
-### 4.3. GitHub Actions 워크플로
+#### Dockerfile 빌드 흐름
 
-**파일**: `.github/workflows/build-push-ecr.yml`
+1. **Builder Stage**: Node.js 22-alpine 기반
+   - pnpm 설치 및 의존성 설치
+   - `API_URL` 환경변수로 GraphQL 엔드포인트 설정
+   - `pnpm run generate:main` → `vite build`
+
+2. **Runner Stage**: nginx:stable-alpine 기반
+   - 빌드된 static 파일을 nginx로 서빙
+   - SPA fallback 설정 포함
+
+#### GitHub Actions 실행 흐름
 
 ```yaml
-name: Build and Push Dashboard to ECR
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-env:
-  AWS_REGION: ap-southeast-2
-
-permissions:
-  id-token: write
-  contents: read
+# .github/workflows/build-push-dashboard-ecr.yml
+on: push (main), workflow_dispatch
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        env: [dev, stage, prod]
+  build:
+    matrix: [dev, stage, prod]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: aws-actions/amazon-ecr-login@v2
-        id: login-ecr
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          build-args: |
-            API_URI=https://storefront1.saleor.cloud/graphql/
-          tags: |
-            ${{ secrets.ECR_REGISTRY }}/min-kyeol-dashboard:${{ matrix.env }}-latest
-            ${{ secrets.ECR_REGISTRY }}/min-kyeol-dashboard:${{ github.sha }}
+      1. Checkout
+      2. OIDC AWS 인증 (AWS_ROLE_ARN)
+      3. ECR 로그인
+      4. Docker Buildx 설정
+      5. Build & Push (환경별 API_URL)
 ```
 
-### 4.4. GitHub Secrets 설정
+#### ECR 태그 규칙
 
-| Secret | Value |
-|--------|-------|
+| 환경 | 태그 | API_URL |
+|:----:|------|---------|
+| DEV | `dev-latest`, `dev-{sha}` | `origin-dev-kyeol.msp-g1.click/graphql/` |
+| STAGE | `stage-latest`, `stage-{sha}` | `origin-stage-kyeol.msp-g1.click/graphql/` |
+| PROD | `prod-latest`, `prod-{sha}` | `origin-prod-kyeol.msp-g1.click/graphql/` |
+
+#### GitHub Secrets 필수 설정
+
+| Secret | 값 예시 |
+|--------|---------|
 | `AWS_ROLE_ARN` | `arn:aws:iam::827913617839:role/github-actions-ecr-push` |
-| `ECR_REGISTRY` | `827913617839.dkr.ecr.ap-southeast-2.amazonaws.com` |
+
+> GitHub Actions OIDC를 사용하므로 AWS Access Key 대신 IAM Role을 사용합니다.
+
+#### 트러블슈팅
+
+| 오류 | 원인 | 해결 |
+|------|------|------|
+| ECR 로그인 실패 | OIDC 설정 오류 | IAM Role Trust Policy에 GitHub OIDC Provider 추가 |
+| 빌드 실패 (pnpm) | 의존성 캐시 | `pnpm-lock.yaml` 일관성 확인 |
+| API_URL 미적용 | ARG 순서 | Dockerfile에서 ARG 선언 후 ENV 사용 |
+
+#### 수동 빌드 (로컬 테스트)
+
+```powershell
+cd D:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-saleor-dashboard
+
+# DEV 환경 빌드
+docker build --build-arg API_URL=https://origin-dev-kyeol.msp-g1.click/graphql/ -t dashboard:dev .
+
+# 로컬 실행
+docker run -p 8080:80 dashboard:dev
+```
+
+### 4.3. GitHub Actions Workflow 파일
 
 ---
 

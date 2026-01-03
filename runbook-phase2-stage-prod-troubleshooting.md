@@ -42,6 +42,248 @@ Error: engine "valkey" does not support num_cache_nodes > 1
 - `envs/stage/main.tf` - replicas_per_node_group=1 사용
 - `envs/prod/main.tf` - replicas_per_node_group 사용
 
+---
+
+## 0-1. ECR RepositoryAlreadyExistsException
+
+### 오류 메시지
+
+```
+Error: creating ECR Repository (min-kyeol-api): RepositoryAlreadyExistsException: 
+The repository with name 'min-kyeol-api' already exists in the registry with id '827913617839'
+```
+
+### 원인
+
+- ECR 레포지토리명이 환경(dev/stage/prod)과 무관하게 동일(`min-kyeol-api` 등)
+- DEV에서 이미 생성된 레포지토리가 있어 STAGE/PROD에서 충돌
+
+### 해결 방법
+
+**envs/stage/main.tf, envs/prod/main.tf 수정**:
+
+```hcl
+# 수정 전 (충돌 발생)
+name_prefix = "${var.owner_prefix}-${var.project_name}"
+# 결과: min-kyeol-api
+
+# 수정 후 (환경별 고유)
+name_prefix = "${var.owner_prefix}-${var.project_name}-${var.environment}"
+# 결과: min-kyeol-stage-api, min-kyeol-prod-api
+```
+
+### 재발 방지
+
+- 환경간 공유되면 안되는 리소스는 반드시 `environment` 포함
+- ECR은 환경별로 분리하거나, 공유 시 한 곳에서만 생성
+
+---
+
+## 0-2. Valkey CacheParameterGroupNotFound
+
+### 오류 메시지
+
+```
+Error: creating ElastiCache Replication Group: CacheParameterGroupNotFound: 
+Cache parameter group default.valkey72 is not found.
+```
+
+### 원인
+
+- 코드에서 `parameter_group_name = "default.valkey72"` 처럼 추정된 이름을 사용
+- AWS에 해당 기본 Parameter Group이 존재하지 않음
+- Valkey 엔진의 기본 파라미터 그룹 네이밍이 예상과 다를 수 있음
+
+### 해결 방법
+
+**modules/valkey/main.tf 수정**:
+
+```hcl
+# 수정 전 (추정 네이밍)
+parameter_group_name = "default.${var.engine}${replace(var.engine_version, ".", "")}"
+
+# 수정 후 (null이면 AWS 기본값 사용, 속성 생략)
+parameter_group_name = local.effective_parameter_group_name
+# effective_parameter_group_name = null 이면 AWS가 적절한 기본 Parameter Group 사용
+```
+
+**modules/valkey/variables.tf 수정**:
+
+```hcl
+variable "parameter_group_name" {
+  description = "사용할 Parameter Group 이름 (null이면 AWS 기본값 사용)"
+  type        = string
+  default     = null
+}
+
+variable "create_parameter_group" {
+  description = "커스텀 Parameter Group 생성 여부"
+  type        = bool
+  default     = false
+}
+```
+
+### 재발 방지
+
+- AWS 기본 리소스명을 추정/하드코딩하지 않는다
+- `null`로 설정하여 AWS 기본 동작에 위임하거나
+- 명시적으로 커스텀 리소스를 생성하여 사용
+
+---
+
+## 0-3. Terraform coalesce() null 오류
+
+### 오류 메시지
+
+```
+Error: Error in function call
+
+  on ..\..\modules\valkey\main.tf line 10, in locals:
+  10:   effective_parameter_group_name = coalesce(
+  ...
+Call to function "coalesce" failed: no non-null, non-empty-string arguments.
+```
+
+### 원인
+
+- `coalesce(arg1, arg2, ...)` 함수는 모든 인자가 null이면 에러 발생
+- `coalesce(null, null)` 형태가 되어 실패
+
+### 해결 방법
+
+**coalesce 대신 삼항 연산자 사용**:
+
+```hcl
+# 수정 전 (오류 발생)
+effective_parameter_group_name = coalesce(
+  var.parameter_group_name,
+  var.create_parameter_group ? aws_elasticache_parameter_group.main[0].name : null
+)
+
+# 수정 후 (null 안전)
+effective_parameter_group_name = (
+  var.parameter_group_name != null ? var.parameter_group_name :
+  (var.create_parameter_group ? aws_elasticache_parameter_group.main[0].name : null)
+)
+```
+
+### 재발 방지 원칙
+
+1. **coalesce() 사용 금지** - 모든 인자가 null일 가능성이 있으면 사용하지 않는다
+2. **조건부 삼항 연산자 사용** - null 허용이 필요하면 삼항 연산자로 처리
+3. **빈 tuple 인덱싱 금지** - `count`로 생성한 리소스는 조건문 안에서만 인덱싱한다
+
+```hcl
+# ❌ 잘못된 예 (count=0이면 에러)
+name = aws_elasticache_parameter_group.main[0].name
+
+# ✅ 올바른 예 (조건문 안에서만 인덱싱)
+name = var.create_parameter_group ? aws_elasticache_parameter_group.main[0].name : null
+```
+
+---
+
+## 0-4. Valkey Invalid Cache Node Type (r6g.medium)
+
+### 오류 메시지
+
+```
+Error: creating ElastiCache Replication Group: InvalidParameterValue: 
+Invalid Cache Node Type: cache.r6g.medium.
+```
+
+### 원인
+
+- ElastiCache(Valkey/Redis)에서 **r6g 계열은 medium 크기를 지원하지 않음**
+- r6g 계열은 `large` 이상부터 사용 가능
+- t3, t4g 계열은 micro, small, medium 모두 지원
+
+### 환경별 권장 노드 타입
+
+| 환경 | 권장 노드 타입 | 비고 |
+|:----:|---------------|------|
+| DEV | `cache.t3.micro` | 비용 절감 |
+| STAGE | `cache.t3.small` | 테스트용 |
+| PROD | `cache.r6g.large` | 고성능, medium 불가 ⚠️ |
+
+### 해결 방법
+
+**envs/prod/terraform.tfvars 수정**:
+
+```hcl
+# ❌ 잘못된 설정
+cache_node_type = "cache.r6g.medium"
+
+# ✅ 올바른 설정
+cache_node_type = "cache.r6g.large"
+```
+
+### 재발 방지
+
+- modules/valkey/variables.tf에 validation 추가됨:
+  - r6g, r6gd, r5, r4 계열의 medium은 자동 차단
+  - t3, t4g 계열은 모든 크기 허용
+
+---
+
+## 0-5. GitHub Actions OIDC 인증 실패
+
+### 오류 메시지
+
+```
+Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+### 원인
+
+- IAM Role의 **Trust Policy**에 해당 GitHub 레포지토리가 등록되어 있지 않음
+- 새로운 레포(`kyeol-saleor-dashboard` 등)를 추가할 때 Trust Policy 업데이트 필요
+
+### 해결 방법
+
+**1. Trust Policy 파일 생성** (`trust-policy.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::827913617839:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:mandoofu/kyeol-storefront:*",
+            "repo:mandoofu/kyeol-saleor-dashboard:*"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+**2. AWS CLI로 업데이트**:
+
+```powershell
+$env:AWS_PAGER=''
+aws iam update-assume-role-policy --role-name github-actions-ecr-push --policy-document file://trust-policy.json
+```
+
+**3. GitHub Actions 재실행**:
+- GitHub > Actions > "Re-run all jobs" 또는 새 커밋 푸시
+
+### 재발 방지
+
+- 새 레포지토리 추가 시 반드시 Trust Policy에 `repo:{owner}/{repo}:*` 추가
+- `trust-policy.json`은 `kyeol-infra-terraform/` 디렉토리에 보관
+
 ## 1. 발생한 오류 유형
 
 ### 1.1. Unsupported argument 오류
