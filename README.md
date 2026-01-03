@@ -2,6 +2,10 @@
 
 > **Saleor e-Commerce 플랫폼의 Multi-Environment(DEV/STAGE/PROD) 배포를 위한 기술 문서 저장소**
 
+## 🏗️ 전체 아키텍처
+
+![KYEOL Saleor Architecture](architecture.png)
+
 ---
 
 ## 👋 처음 오신 분들을 위한 안내
