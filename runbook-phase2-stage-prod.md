@@ -1,116 +1,225 @@
-# KYEOL Phase-2 런북 (STAGE + PROD + Dashboard)
+# Phase-2 STAGE/PROD 환경 배포 런북
 
-Phase-2에서 STAGE, PROD 환경을 활성화하고 Saleor Dashboard를 배포하기 위한 실행 순서입니다.
-
----
-
-## 0. Phase-2 개요
-
-### Phase-1과의 차이
-
-| 항목 | Phase-1 | Phase-2 |
-|------|---------|---------|
-| 환경 | DEV, MGMT | DEV, STAGE, PROD |
-| Storefront | DEV만 | DEV, STAGE, PROD |
-| Dashboard | 없음 | DEV, STAGE, PROD |
-| RDS | Single-AZ | Multi-AZ (STAGE/PROD) |
-| EKS Nodes | 최소 | 단계적 증가 |
-| 캐시 | 비활성 (DEV) | 활성 (STAGE/PROD) |
-
-### Phase-2 스코프
-
-- STAGE VPC 및 EKS 활성화
-- PROD VPC 및 EKS 활성화
-- Saleor Dashboard 배포 (DEV/STAGE/PROD)
-- 환경별 HPA 적용
+> **작성일**: 2026-01-03  
+> **버전**: 2.0  
+> **대상 환경**: STAGE, PROD (DEV 포함)  
+> **목표**: Saleor Storefront + Dashboard를 DEV/STAGE/PROD 환경에서 HTTPS로 정상 접속
 
 ---
 
-## 1. 사전 준비
+## 목차
 
-### 1.1. Phase-1 완료 확인
+1. [사전 요구사항](#1-사전-요구사항)
+2. [레포지토리 클론](#2-레포지토리-클론)
+3. [Terraform 인프라 배포](#3-terraform-인프라-배포)
+4. [Kubernetes 컨텍스트 설정](#4-kubernetes-컨텍스트-설정)
+5. [Helm Addons 설치](#5-helm-addons-설치)
+6. [GitHub Actions CI/CD 설정](#6-github-actions-cicd-설정)
+7. [GitOps 앱 배포](#7-gitops-앱-배포)
+8. [URL 접속 검증](#8-url-접속-검증)
+9. [트러블슈팅](#9-트러블슈팅)
+10. [운영 주의사항](#10-운영-주의사항)
+
+---
+
+## 1. 사전 요구사항
+
+### 1.1. 필수 도구 설치
+
+| 도구 | 버전 | 설치 확인 명령 |
+|------|------|----------------|
+| AWS CLI | v2.x | `aws --version` |
+| Terraform | >= 1.5.0 | `terraform --version` |
+| kubectl | >= 1.28 | `kubectl version --client` |
+| Helm | >= 3.12 | `helm version` |
+| Git | >= 2.40 | `git --version` |
+| PowerShell | 7.x | `$PSVersionTable.PSVersion` |
+
+### 1.2. AWS 자격 증명
 
 ```powershell
-# DEV 환경 확인
-aws eks describe-cluster --name min-kyeol-dev-eks --region ap-southeast-2 --query "cluster.status"
+# AWS CLI 설정 확인
+aws sts get-caller-identity
 
-# MGMT ArgoCD 확인
-kubectl --context mgmt -n argocd get pods
+# 기대 출력: Account ID, ARN 표시
 ```
 
-### 1.2. ACM 인증서 발급 (STAGE/PROD용)
+### 1.3. 필수 AWS 리소스 (사전 생성 필요)
 
-```powershell
-# STAGE용 ACM 인증서 요청
-aws acm request-certificate `
-  --domain-name "origin-stage-kyeol.msp-g1.click" `
-  --subject-alternative-names "stage-dashboard-kyeol.msp-g1.click" `
-  --validation-method DNS `
-  --region ap-southeast-2
-
-# PROD용 ACM 인증서 요청
-aws acm request-certificate `
-  --domain-name "origin-prod-kyeol.msp-g1.click" `
-  --subject-alternative-names "dashboard-kyeol.msp-g1.click" `
-  --validation-method DNS `
-  --region ap-southeast-2
-
-# 인증서 확인
-aws acm list-certificates --region ap-southeast-2
-```
-
-> ⚠️ DNS 검증을 위해 Route53에 CNAME 레코드를 추가해야 합니다.
-> 해당리전에 위 명령으로 생성된 ACM 목록 들어가서 Route53에 CNAME 레코드 추가 버튼으로 추가 가능
+| 리소스 | 설명 |
+|--------|------|
+| Route53 Hosted Zone | `msp-g1.click` (Hosted Zone ID 필요) |
+| ACM 인증서 | `*.msp-g1.click` 와일드카드 인증서 (ISSUED 상태) |
+| GitHub OIDC Provider | IAM에 등록된 GitHub Actions OIDC 공급자 |
 
 ---
 
-## 2. STAGE 환경 배포
-
-### 2.1. Terraform 설정
+## 2. 레포지토리 클론
 
 ```powershell
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\stage
+# 워크스페이스 생성
+mkdir D:\WORKSPACE\saleor-demo
+cd D:\WORKSPACE\saleor-demo
 
-# tfvars 복사 및 편집
+# 1. Terraform 인프라
+git clone https://github.com/mandoofu/kyeol-infra-terraform.git
+
+# 2. Platform GitOps (Helm Addons)
+git clone https://github.com/mandoofu/kyeol-platform-gitops.git
+
+# 3. App GitOps (Storefront/Dashboard)
+git clone https://github.com/mandoofu/kyeol-app-gitops.git
+
+# 4. Storefront 소스
+git clone https://github.com/mandoofu/kyeol-storefront.git
+
+# 5. Dashboard 소스
+git clone https://github.com/mandoofu/kyeol-saleor-dashboard.git
+```
+
+---
+
+## 3. Terraform 인프라 배포
+
+### 3.1. Bootstrap (최초 1회)
+
+```powershell
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\bootstrap
+
+# tfvars 생성
 Copy-Item terraform.tfvars.example terraform.tfvars
-# terraform.tfvars 편집: aws_account_id, hosted_zone_id 설정
+# terraform.tfvars 편집: aws_account_id, hosted_zone_id 입력
 
-# 초기화
 terraform init
-
-# 계획 확인
 terraform plan
-
-# 적용 (비대화형)
 terraform apply -auto-approve
 ```
 
-### 2.2. kubeconfig 연결
+### 3.2. MGMT 환경
 
 ```powershell
-aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-stage-eks --alias stage
-kubectl config use-context stage
-kubectl get nodes
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\mgmt
+
+Copy-Item terraform.tfvars.example terraform.tfvars
+# terraform.tfvars 편집
+
+terraform init
+terraform plan
+terraform apply -auto-approve
 ```
 
-### 2.3. Addons 설치
+### 3.3. DEV 환경
 
 ```powershell
-# IRSA Role ARN 확인
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\stage
-$STAGE_ALB_ROLE_ARN = terraform output -raw alb_controller_role_arn
-$STAGE_EDNS_ROLE_ARN = terraform output -raw external_dns_role_arn
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\dev
 
-# AWS Load Balancer Controller
+Copy-Item terraform.tfvars.example terraform.tfvars
+# terraform.tfvars 편집
+
+terraform init
+terraform plan
+terraform apply -auto-approve
+```
+
+### 3.4. STAGE 환경
+
+```powershell
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\stage
+
+Copy-Item terraform.tfvars.example terraform.tfvars
+# terraform.tfvars 편집 (cache_node_type = "cache.t3.small" 권장)
+
+terraform init
+terraform plan
+terraform apply -auto-approve
+```
+
+### 3.5. PROD 환경
+
+```powershell
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
+
+Copy-Item terraform.tfvars.example terraform.tfvars
+# terraform.tfvars 편집 (cache_node_type = "cache.r6g.large" 필수, r6g.medium 불가)
+
+terraform init
+terraform plan
+terraform apply -auto-approve
+```
+
+### 3.6. Terraform Output 확인
+
+```powershell
+# 각 환경에서 실행
+terraform output eks_cluster_name
+terraform output alb_controller_role_arn
+terraform output external_dns_role_arn
+
+# 기대 출력: 리소스 이름/ARN
+```
+
+---
+
+## 4. Kubernetes 컨텍스트 설정
+
+```powershell
+# MGMT
+aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-mgmt-eks --alias mgmt
+
+# DEV
+aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-dev-eks --alias dev
+
+# STAGE
+aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-stage-eks --alias stage
+
+# PROD
+aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-prod-eks --alias prod
+
+# 컨텍스트 확인
+kubectl config get-contexts
+
+# 기대 출력: dev, mgmt, stage, prod 컨텍스트 목록
+```
+
+---
+
+## 5. Helm Addons 설치
+
+### 5.1. Helm 레포 추가
+
+```powershell
+helm repo add eks https://aws.github.io/eks-charts
+helm repo add external-dns https://kubernetes-sigs.github.io/external-dns
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server
+helm repo update
+```
+
+### 5.2. STAGE Addons 설치
+
+> ⚠️ **중요**: ALB Controller → ExternalDNS → Metrics Server 순서 필수
+
+```powershell
+kubectl config use-context stage
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\stage
+
+# 1. ALB Controller
+$ALB_ROLE_ARN = terraform output -raw alb_controller_role_arn
+
 helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller `
   -n kube-system `
   --set clusterName=min-kyeol-stage-eks `
   --set serviceAccount.create=true `
   --set serviceAccount.name=aws-load-balancer-controller `
-  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$STAGE_ALB_ROLE_ARN" `
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ALB_ROLE_ARN" `
   --set replicaCount=2
 
-# ExternalDNS
+# ALB Controller Ready 확인 (필수!)
+kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
+# 기대 출력: 2개 pods Running
+
+# 2. ExternalDNS
+$EDNS_ROLE_ARN = terraform output -raw external_dns_role_arn
+
 helm upgrade --install external-dns external-dns/external-dns `
   -n kube-system `
   --set provider=aws `
@@ -120,65 +229,33 @@ helm upgrade --install external-dns external-dns/external-dns `
   --set policy=sync `
   --set serviceAccount.create=true `
   --set serviceAccount.name=external-dns `
-  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$STAGE_EDNS_ROLE_ARN" `
-  --set replicaCount=2
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$EDNS_ROLE_ARN"
 
-# Metrics Server
+# 3. Metrics Server
 helm upgrade --install metrics-server metrics-server/metrics-server `
   -n kube-system --set replicas=2
 ```
 
-### 2.4. 검증
+### 5.3. PROD Addons 설치
 
 ```powershell
-kubectl get pods -n kube-system | Select-String "aws-load-balancer|external-dns|metrics-server"
-```
-
----
-
-## 3. PROD 환경 배포
-
-### 3.1. Terraform 설정
-
-```powershell
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
-
-# tfvars 복사 및 편집
-Copy-Item terraform.tfvars.example terraform.tfvars
-# terraform.tfvars 편집
-
-# 초기화 및 적용
-terraform init
-terraform plan
-terraform apply -auto-approve
-```
-
-### 3.2. kubeconfig 연결
-
-```powershell
-aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-prod-eks --alias prod
 kubectl config use-context prod
-kubectl get nodes
-```
+cd D:\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
 
-### 3.3. Addons 설치
+# 1. ALB Controller
+$ALB_ROLE_ARN = terraform output -raw alb_controller_role_arn
 
-```powershell
-# IRSA Role ARN 확인
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
-$PROD_ALB_ROLE_ARN = terraform output -raw alb_controller_role_arn
-$PROD_EDNS_ROLE_ARN = terraform output -raw external_dns_role_arn
-
-# AWS Load Balancer Controller (3 replicas for HA)
 helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller `
   -n kube-system `
   --set clusterName=min-kyeol-prod-eks `
   --set serviceAccount.create=true `
   --set serviceAccount.name=aws-load-balancer-controller `
-  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$PROD_ALB_ROLE_ARN" `
-  --set replicaCount=3
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ALB_ROLE_ARN" `
+  --set replicaCount=2
 
-# ExternalDNS (3 replicas for HA)
+# 2. ExternalDNS
+$EDNS_ROLE_ARN = terraform output -raw external_dns_role_arn
+
 helm upgrade --install external-dns external-dns/external-dns `
   -n kube-system `
   --set provider=aws `
@@ -188,380 +265,326 @@ helm upgrade --install external-dns external-dns/external-dns `
   --set policy=sync `
   --set serviceAccount.create=true `
   --set serviceAccount.name=external-dns `
-  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$PROD_EDNS_ROLE_ARN" `
-  --set replicaCount=3
+  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$EDNS_ROLE_ARN"
 
-# Metrics Server
+# 3. Metrics Server
 helm upgrade --install metrics-server metrics-server/metrics-server `
-  -n kube-system --set replicas=3
+  -n kube-system --set replicas=2
 ```
-
-### 3.4. Helm 설치 주의사항
-
-> ⚠️ **ALB Controller → ExternalDNS 순서 필수**
-
-```powershell
-# 1. ALB Controller 먼저 설치
-helm upgrade --install aws-load-balancer-controller ...
-
-# 2. ALB Controller Ready 확인 (필수!)
-kubectl -n kube-system get pods -l app.kubernetes.io/name=aws-load-balancer-controller
-kubectl -n kube-system get endpoints aws-load-balancer-webhook-service
-
-# 3. Ready 확인 후 ExternalDNS 설치
-helm upgrade --install external-dns ...
-```
-
-> ⚠️ **Webhook 엔드포인트 없음 오류 발생 시**:
-> ALB Controller pods가 아직 Ready 상태가 아님. 잠시 대기 후 재시도.
 
 ---
 
-## 4. PROD 적용 체크리스트
+## 6. GitHub Actions CI/CD 설정
 
-### 4.1. STAGE→PROD 동기화 수정사항
+### 6.1. GitHub Secrets 설정
 
-아래 항목들은 STAGE에서 해결된 후 PROD에 동일 적용되었습니다:
+각 레포지토리에 다음 Secret 추가:
 
-| # | 수정 항목 | 파일 | 상태 |
-|:-:|----------|------|:----:|
-| 1 | ECR name_prefix에 environment 포함 | `envs/prod/main.tf` | ✅ |
-| 2 | EKS 모듈 enable_alb_controller_irsa 사용 | `envs/prod/main.tf` | ✅ |
-| 3 | EKS 모듈 external_dns_hosted_zone_id 사용 | `envs/prod/main.tf` | ✅ |
-| 4 | VPC 모듈 eks_cluster_name 사용 | `envs/prod/main.tf` | ✅ |
-| 5 | Valkey Replication Group 기반 | `envs/prod/main.tf` | ✅ |
-| 6 | RDS outputs db_instance_* 사용 | `envs/prod/outputs.tf` | ✅ |
-| 7 | Valkey outputs cache_* 사용 | `envs/prod/outputs.tf` | ✅ |
-
-### 4.2. PROD 전용 설정 확인
-
-| 항목 | 기대값 | 확인 방법 |
-|------|--------|----------|
-| RDS Multi-AZ | `true` | `terraform output rds_multi_az` |
-| RDS 삭제 보호 | `true` | `terraform output rds_deletion_protection` |
-| EKS 노드 수 | 3+ | `kubectl get nodes` |
-| Valkey HA | replicas=1+ | `terraform output valkey_endpoint` |
-| NAT Gateway | AZ별 분리 | AWS 콘솔 |
-
-### 4.3. PROD 배포 전 검증 명령
-
-```powershell
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-infra-terraform\envs\prod
-
-# 1. 코드 포맷팅
-terraform fmt
-
-# 2. 정적 검증
-terraform validate
-
-# 3. Plan 확인 (리소스 변경 사항 검토)
-terraform plan -out=tfplan
-
-# 4. Plan 내용 검토 후 적용
-terraform apply tfplan
-```
-
-### 4.4. PROD 배포 후 검증
-
-```powershell
-# kubeconfig 설정
-aws eks update-kubeconfig --region ap-southeast-2 --name min-kyeol-prod-eks --alias prod
-
-# 노드 확인
-kubectl --context prod get nodes
-
-# Addons 확인
-kubectl --context prod -n kube-system get pods | Select-String "aws-load-balancer|external-dns|metrics-server"
-
-# RDS 연결 테스트 (선택)
-terraform output -raw rds_endpoint
-```
-
-### 4.5. PROD 주의사항
-
-> [!CAUTION]
-> **RDS 삭제 보호**: `rds_deletion_protection = true` 설정으로 실수로 삭제 방지
-> 
-> **terraform destroy 전 확인**:
-> ```powershell
-> # RDS 삭제 보호 해제 필요 (의도적 삭제 시)
-> aws rds modify-db-instance --db-instance-identifier <id> --no-deletion-protection
-> ```
-
-> [!WARNING]
-> **비용 주의**: PROD는 Multi-AZ RDS, 다중 NAT Gateway, 더 많은 EKS 노드로 인해 DEV/STAGE보다 비용이 높음
-
-### 4.6. terraform.tfvars 커밋 금지
-
-```powershell
-# 실제 값이 들어간 terraform.tfvars는 절대 커밋하지 않음
-# .gitignore에 추가되어 있는지 확인
-Get-Content .gitignore | Select-String "terraform.tfvars"
-
-# terraform.tfvars.example만 유지
-```
-
-## 4. Saleor Dashboard ECR 이미지 준비
-
-### 4.1. kyeol-saleor-dashboard 레포 생성
-
-GitHub에서 `saleor/saleor-dashboard`를 Fork하여 `kyeol-saleor-dashboard` 레포 생성
-
-```powershell
-# Fork 후 클론
-git clone https://github.com/mandoofu/kyeol-saleor-dashboard.git
-cd kyeol-saleor-dashboard
-```
-
-### 4.2. Saleor Dashboard Image Build & ECR Push (GitHub Actions)
-
-#### 디렉토리 구조
-
-```
-kyeol-saleor-dashboard/
-├── .github/
-│   └── workflows/
-│       └── build-push-dashboard-ecr.yml  # ECR 빌드/푸시 워크플로
-├── Dockerfile                             # 멀티스테이지 빌드
-├── nginx/                                 # nginx 설정
-│   └── default.conf
-├── src/                                   # 소스 코드
-├── package.json
-└── pnpm-lock.yaml
-```
-
-#### Dockerfile 빌드 흐름
-
-1. **Builder Stage**: Node.js 22-alpine 기반
-   - pnpm 설치 및 의존성 설치
-   - `API_URL` 환경변수로 GraphQL 엔드포인트 설정
-   - `pnpm run generate:main` → `vite build`
-
-2. **Runner Stage**: nginx:stable-alpine 기반
-   - 빌드된 static 파일을 nginx로 서빙
-   - SPA fallback 설정 포함
-
-#### GitHub Actions 실행 흐름
-
-```yaml
-# .github/workflows/build-push-dashboard-ecr.yml
-on: push (main), workflow_dispatch
-
-jobs:
-  build:
-    matrix: [dev, stage, prod]
-    steps:
-      1. Checkout
-      2. OIDC AWS 인증 (AWS_ROLE_ARN)
-      3. ECR 로그인
-      4. Docker Buildx 설정
-      5. Build & Push (환경별 API_URL)
-```
-
-#### ECR 태그 규칙
-
-| 환경 | 태그 | API_URL |
-|:----:|------|---------|
-| DEV | `dev-latest`, `dev-{sha}` | `origin-dev-kyeol.msp-g1.click/graphql/` |
-| STAGE | `stage-latest`, `stage-{sha}` | `origin-stage-kyeol.msp-g1.click/graphql/` |
-| PROD | `prod-latest`, `prod-{sha}` | `origin-prod-kyeol.msp-g1.click/graphql/` |
-
-#### GitHub Secrets 필수 설정
-
-| Secret | 값 예시 |
-|--------|---------|
+| Secret | 값 |
+|--------|-----|
 | `AWS_ROLE_ARN` | `arn:aws:iam::827913617839:role/github-actions-ecr-push` |
 
-> GitHub Actions OIDC를 사용하므로 AWS Access Key 대신 IAM Role을 사용합니다.
+### 6.2. GitHub OIDC Trust Policy
 
-#### 트러블슈팅
-
-| 오류 | 원인 | 해결 |
-|------|------|------|
-| ECR 로그인 실패 | OIDC 설정 오류 | IAM Role Trust Policy에 GitHub OIDC Provider 추가 |
-| 빌드 실패 (pnpm) | 의존성 캐시 | `pnpm-lock.yaml` 일관성 확인 |
-| API_URL 미적용 | ARG 순서 | Dockerfile에서 ARG 선언 후 ENV 사용 |
-
-#### 수동 빌드 (로컬 테스트)
-
-```powershell
-cd D:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-saleor-dashboard
-
-# DEV 환경 빌드
-docker build --build-arg API_URL=https://origin-dev-kyeol.msp-g1.click/graphql/ -t dashboard:dev .
-
-# 로컬 실행
-docker run -p 8080:80 dashboard:dev
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::827913617839:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": [
+            "repo:mandoofu/kyeol-storefront:*",
+            "repo:mandoofu/kyeol-saleor-dashboard:*"
+          ]
+        }
+      }
+    }
+  ]
+}
 ```
 
-### 4.3. GitHub Actions Workflow 파일
+### 6.3. ECR 이미지 태그 규칙
+
+| ECR Repository | 태그 규칙 |
+|----------------|----------|
+| `min-kyeol-storefront` | `dev-latest`, `stage-latest`, `prod-latest` |
+| `min-kyeol-dashboard` | `dev-latest`, `stage-latest`, `prod-latest` |
 
 ---
 
-## 5. ArgoCD Application 동기화
+## 7. GitOps 앱 배포
 
-### 5.1. Storefront 배포
+### 7.1. ACM 인증서 ARN 확인
 
 ```powershell
-# MGMT 클러스터에서 ArgoCD Application 적용
-kubectl config use-context mgmt
+# ACM 인증서 목록 조회
+aws acm list-certificates --region ap-southeast-2 --query "CertificateSummaryList[*].[DomainName,CertificateArn]" --output table
 
-# STAGE Storefront
-kubectl apply -f d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops\argocd\applications\saleor-stage.yaml
-
-# PROD Storefront
-kubectl apply -f d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops\argocd\applications\saleor-prod.yaml
+# msp-g1.click 와일드카드 인증서 ARN 복사
 ```
 
-### 5.2. Dashboard 배포
+### 7.2. Ingress Patch 파일 수정
+
+> ⚠️ **중요**: 아래 4개 파일에서 `STAGE_CERT_ID`, `PROD_CERT_ID`를 실제 ACM ARN으로 교체
+
+**수정 대상 파일**:
+
+| 환경 | 파일 경로 | 교체 대상 |
+|------|----------|----------|
+| STAGE Storefront | `apps/saleor/overlays/stage/patches/ingress-patch.yaml` | `STAGE_CERT_ID` |
+| PROD Storefront | `apps/saleor/overlays/prod/patches/ingress-patch.yaml` | `PROD_CERT_ID` |
+| STAGE Dashboard | `apps/saleor-dashboard/overlays/stage/patches/ingress-patch.yaml` | `STAGE_CERT_ID` |
+| PROD Dashboard | `apps/saleor-dashboard/overlays/prod/patches/ingress-patch.yaml` | `PROD_CERT_ID` |
+
+### 7.3. STAGE 배포
 
 ```powershell
-# DEV Dashboard
-kubectl apply -f d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops\argocd\applications\dashboard-dev.yaml
+kubectl config use-context stage
 
-# STAGE Dashboard
-kubectl apply -f d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops\argocd\applications\dashboard-stage.yaml
+# Storefront
+kubectl apply -k D:\WORKSPACE\saleor-demo\kyeol-app-gitops\apps\saleor\overlays\stage
 
-# PROD Dashboard
-kubectl apply -f d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops\argocd\applications\dashboard-prod.yaml
+# Dashboard
+kubectl apply -k D:\WORKSPACE\saleor-demo\kyeol-app-gitops\apps\saleor-dashboard\overlays\stage
+
+# 배포 확인
+kubectl -n kyeol get pods,svc,ingress
 ```
 
-### 5.3. 동기화 상태 확인
+### 7.4. PROD 배포
 
 ```powershell
-kubectl -n argocd get applications
+kubectl config use-context prod
+
+# Storefront
+kubectl apply -k D:\WORKSPACE\saleor-demo\kyeol-app-gitops\apps\saleor\overlays\prod
+
+# Dashboard
+kubectl apply -k D:\WORKSPACE\saleor-demo\kyeol-app-gitops\apps\saleor-dashboard\overlays\prod
+
+# 배포 확인
+kubectl -n kyeol get pods,svc,ingress
 ```
 
 ---
 
-## 6. 검증 절차
+## 8. URL 접속 검증
 
-### 6.1. Storefront 검증
+### 8.1. Ingress ALB 주소 확인 (2-3분 대기)
 
-| 환경 | URL | 예상 결과 |
-|------|-----|----------|
-| DEV | https://origin-dev-kyeol.msp-g1.click | 200 OK |
-| STAGE | https://origin-stage-kyeol.msp-g1.click | 200 OK |
-| PROD | https://origin-prod-kyeol.msp-g1.click | 200 OK |
+```powershell
+# STAGE
+kubectl --context stage -n kyeol get ingress -o wide
+
+# PROD
+kubectl --context prod -n kyeol get ingress -o wide
+
+# ADDRESS 컬럼에 ALB DNS가 표시되면 정상
+```
+
+### 8.2. DNS 레코드 확인
+
+```powershell
+nslookup origin-stage-kyeol.msp-g1.click
+nslookup origin-prod-kyeol.msp-g1.click
+nslookup stage-dashboard-kyeol.msp-g1.click
+nslookup dashboard-kyeol.msp-g1.click
+
+# ALB 주소가 반환되면 정상
+```
+
+### 8.3. URL 접속 테스트
 
 ```powershell
 curl -I https://origin-dev-kyeol.msp-g1.click
 curl -I https://origin-stage-kyeol.msp-g1.click
 curl -I https://origin-prod-kyeol.msp-g1.click
+curl -I https://stage-dashboard-kyeol.msp-g1.click
+curl -I https://dashboard-kyeol.msp-g1.click
+
+# HTTP/2 200 또는 HTTP/2 301/302 → 정상
 ```
 
-### 6.2. Dashboard 검증
+### 8.4. 환경별 URL 표
 
-| 환경 | URL | 예상 결과 |
-|------|-----|----------|
-| DEV | https://dev-dashboard-kyeol.msp-g1.click | Dashboard UI |
-| STAGE | https://stage-dashboard-kyeol.msp-g1.click | Dashboard UI |
-| PROD | https://dashboard-kyeol.msp-g1.click | Dashboard UI |
+| 환경 | 앱 | URL |
+|:----:|:--:|-----|
+| DEV | Storefront | https://origin-dev-kyeol.msp-g1.click |
+| DEV | Dashboard | https://dev-dashboard-kyeol.msp-g1.click |
+| STAGE | Storefront | https://origin-stage-kyeol.msp-g1.click |
+| STAGE | Dashboard | https://stage-dashboard-kyeol.msp-g1.click |
+| PROD | Storefront | https://origin-prod-kyeol.msp-g1.click |
+| PROD | Dashboard | https://dashboard-kyeol.msp-g1.click |
 
-### 6.3. HPA 검증
+---
+
+## 9. 트러블슈팅
+
+### 9.1. ExternalDNS 레코드 미생성
+
+**증상**: Route53에 A 레코드가 없음
+
+**확인**:
+```powershell
+kubectl -n kube-system logs -l app.kubernetes.io/name=external-dns --tail=50
+```
+
+**원인/해결**:
+- IRSA 권한 부족 → IAM Role 정책 확인
+- domainFilters 불일치 → ExternalDNS values 확인
+- Ingress annotation 누락 → `external-dns.alpha.kubernetes.io/hostname` 확인
+
+### 9.2. ALB 미생성 (Ingress ADDRESS 없음)
+
+**증상**: Ingress ADDRESS가 빈 상태, `FailedDeployModel` 이벤트 발생
+
+**확인**:
+```powershell
+# Ingress 이벤트 확인
+kubectl describe ingress -n kyeol
+
+# ALB Controller 로그 확인
+kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller --tail=50
+
+# AccessDenied 검색
+kubectl -n kube-system logs -l app.kubernetes.io/name=aws-load-balancer-controller | Select-String "AccessDenied|error"
+```
+
+**원인/해결**:
+
+| 원인 | 해결 방법 |
+|------|----------|
+| ACM ARN 오류 | 실제 ACM ARN으로 교체 |
+| 서브넷 태그 누락 | `kubernetes.io/role/elb=1` 태그 확인 |
+| **DescribeListenerAttributes 권한 누락** | 아래 코드 수정 참조 |
+
+**DescribeListenerAttributes 권한 이슈 해결 (2026-01 발생)**:
+
+> ⚠️ **중요**: AWS Load Balancer Controller v2.7+ 이후 `DescribeListenerAttributes` API 권한 필요
+
+**증상 로그**:
+```
+AccessDenied: User is not authorized to perform: elasticloadbalancing:DescribeListenerAttributes
+```
+
+**해결 (코드 수정)**:
+
+파일: `kyeol-infra-terraform/modules/eks/iam_irsa.tf`
+
+Describe 권한 블록에 `DescribeListenerAttributes` 추가:
+```hcl
+"elasticloadbalancing:DescribeListeners",
+"elasticloadbalancing:DescribeListenerCertificates",
+"elasticloadbalancing:DescribeListenerAttributes",  # <-- 추가
+"elasticloadbalancing:DescribeSSLPolicies",
+```
+
+**적용 방법**:
+```powershell
+# STAGE
+cd kyeol-infra-terraform/envs/stage
+terraform apply -auto-approve
+
+# PROD
+cd ../prod
+terraform apply -auto-approve
+
+# ALB Controller 재시작
+kubectl --context stage -n kube-system rollout restart deploy/aws-load-balancer-controller
+kubectl --context prod -n kube-system rollout restart deploy/aws-load-balancer-controller
+
+# 1분 후 Ingress ADDRESS 확인
+kubectl --context stage -n kyeol get ingress -o wide
+kubectl --context prod -n kyeol get ingress -o wide
+```
+
+**정상 결과 예시**:
+```
+NAME            CLASS   HOSTS                           ADDRESS                           PORTS   AGE
+kyeol-ingress   alb     origin-stage-kyeol.msp-g1.click k8s-kyeol-kyeoling-xxx.elb.com   80      5m
+```
+
+### 9.3. 502 Bad Gateway
+
+**증상**: URL 접속 시 502 오류
+
+**확인**:
+```powershell
+kubectl -n kyeol get pods
+kubectl -n kyeol describe pods
+```
+
+**원인/해결**:
+- Pod CrashLoopBackOff → 로그 확인, 이미지 태그 확인
+- 헬스체크 실패 → Pod readinessProbe 경로 확인
+- 서비스 포트 불일치 → Service port와 Pod containerPort 확인
+
+### 9.4. Valkey r6g.medium 오류
+
+**증상**: `InvalidParameterValue: Invalid Cache Node Type: cache.r6g.medium`
+
+**해결**: PROD에서 `cache_node_type = "cache.r6g.large"` 사용 (r6g.medium 미지원)
+
+---
+
+## 10. 운영 주의사항
+
+### 10.1. 비용 관리
+
+| 환경 | 예상 비용 요소 |
+|------|---------------|
+| DEV | 단일 NAT, 소규모 노드 |
+| STAGE | 단일 NAT, 중규모 노드 |
+| PROD | 다중 NAT, Multi-AZ RDS, 대규모 노드 |
+
+### 10.2. 보안 체크리스트
+
+- [ ] `terraform.tfvars` 절대 Git 커밋 금지
+- [ ] PROD `rds_deletion_protection = true` 유지
+- [ ] GitHub Secrets에 민감 정보 저장
+- [ ] IAM Role 최소 권한 원칙 준수
+
+### 10.3. 배포 순서 필수
+
+1. ALB Controller Ready 확인 후 ExternalDNS 설치
+2. Ingress 배포 전 ACM ARN 확인
+3. STAGE 검증 후 PROD 배포
+
+### 10.4. 롤백 가이드
 
 ```powershell
-kubectl --context stage -n kyeol get hpa
-kubectl --context prod -n kyeol get hpa
+# Git 이전 버전으로 롤백
+cd D:\WORKSPACE\saleor-demo\kyeol-app-gitops
+git log --oneline -5
+git checkout <commit-hash> -- apps/saleor/overlays/stage/
+
+# 재배포
+kubectl apply -k apps/saleor/overlays/stage --context stage
 ```
 
 ---
 
-## 7. 장애 발생 시 롤백 전략
+## 완료 체크리스트
 
-### 7.1. ArgoCD를 통한 롤백
-
-```powershell
-# 이전 버전으로 롤백 (ArgoCD UI 또는 CLI)
-argocd app rollback saleor-storefront-prod
-```
-
-### 7.2. 이미지 태그 롤백
-
-```yaml
-# kustomization.yaml 수정
-images:
-  - name: ...
-    newTag: <previous-sha>
-```
-
-### 7.3. Terraform 롤백
-
-```powershell
-# 이전 상태로 롤백
-terraform apply -target=module.eks -var-file=terraform.tfvars.backup
-```
+- [ ] Bootstrap Terraform 완료
+- [ ] MGMT/DEV/STAGE/PROD Terraform 완료
+- [ ] 모든 kubeconfig 컨텍스트 설정
+- [ ] STAGE/PROD Addons 설치 완료
+- [ ] GitHub Actions ECR Push 성공
+- [ ] Ingress ACM ARN 실제 값 설정
+- [ ] STAGE/PROD Storefront/Dashboard 배포
+- [ ] 모든 URL HTTPS 접속 확인
+- [ ] HPA 동작 확인
 
 ---
 
-## 8. 환경별 리소스 정책
-
-| 리소스 | DEV | STAGE | PROD |
-|--------|-----|-------|------|
-| Storefront Replicas | 1-2 | 3-6 | 5-20 |
-| Dashboard Replicas | 1 | 2 | 3 |
-| EKS Nodes | 2 | 2-5 | 3-10 |
-| RDS | Single-AZ | Multi-AZ | Multi-AZ + 삭제 보호 |
-| Cache | 비활성 | 활성 (2 nodes) | 활성 (3 nodes) |
-
----
-
-## 9. Phase-3 확장 포인트
-
-### 9.1. CloudFront 연동
-
-- us-east-1에 ACM 인증서 발급
-- CloudFront Distribution 생성
-- `dev-kyeol.msp-g1.click` → CloudFront → ALB
-
-### 9.2. WAF 연동
-
-- AWS WAF WebACL 생성
-- ALB 또는 CloudFront에 연결
-- OWASP Top 10 규칙 적용
-
-### 9.3. 모니터링 강화
-
-- CloudWatch Container Insights
-- Prometheus + Grafana
-- AlertManager 설정
-
----
-
-## 부록 A: GitHub 레포지토리 구조
-
-| # | 레포 이름 | 역할 |
-|:-:|-----------|------|
-| 1 | `kyeol-infra-terraform` | Terraform IaC |
-| 2 | `kyeol-platform-gitops` | ArgoCD, Addons |
-| 3 | `kyeol-app-gitops` | Storefront + Dashboard GitOps |
-| 4 | `kyeol-storefront` | Storefront 앱 (Fork) |
-| 5 | `kyeol-saleor-dashboard` | Dashboard 앱 (Fork) |
-
-## 부록 B: kyeol-app-gitops 푸시
-
-```powershell
-cd d:\4th_Parkminwook\WORKSPACE\saleor-demo\kyeol-app-gitops
-
-# Git 초기화 (이미 안된 경우)
-git init
-git remote add origin https://github.com/mandoofu/kyeol-app-gitops.git
-
-# 변경사항 커밋 및 푸시
-git add .
-git commit -m "Phase-2: Add STAGE/PROD overlays and Dashboard"
-git branch -M main
-git push -u origin main
-```
-
-## 부록 C: Ingress ACM ARN 교체 명령
-
-```powershell
-# STAGE ACM ARN 조회
-aws acm list-certificates --region ap-southeast-2 --query "CertificateSummaryList[?DomainName=='origin-stage-kyeol.msp-g1.click'].CertificateArn" --output text
-
-# PROD ACM ARN 조회
-aws acm list-certificates --region ap-southeast-2 --query "CertificateSummaryList[?DomainName=='origin-prod-kyeol.msp-g1.click'].CertificateArn" --output text
-```
-
-파일에서 `STAGE_CERT_ID` / `PROD_CERT_ID`를 실제 ARN으로 교체
+> **문서 끝**
